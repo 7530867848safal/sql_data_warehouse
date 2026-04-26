@@ -1,89 +1,146 @@
+-- ============================================================
+-- Stored Procedure : silver.load_silver
+-- Author           : Safal Arora
+-- Created          : 2026-04-26
+-- Description      : Creates all Silver layer tables for the
+--                    Data Warehouse project. Implements the
+--                    idempotent pattern — drops and recreates
+--                    each table on every run to ensure a clean,
+--                    consistent load from the Bronze layer.
+--
+--                    Key differences from Bronze:
+--                    - dwh_created_date audit column added to
+--                      every table to track load timestamp
+--                    - Data will be cleaned, standardised, and
+--                      deduplicated during INSERT (load script)
+--
+-- Source Layer     : Bronze (Raw)
+-- Target Layer     : Silver (Cleaned & Standardised)
+-- ============================================================
 
 CREATE OR ALTER PROCEDURE silver.load_silver AS
 
 BEGIN
 
-IF OBJECT_ID ('silver.crm_cust_info', 'U') IS NOT NULL
-	DROP TABLE silver.crm_cust_info;
+    -- --------------------------------------------------------
+    -- CRM TABLES
+    -- Source : bronze.crm_*
+    -- --------------------------------------------------------
 
-create table silver.crm_cust_info
-(	cst_id INT,
-	cst_key NVARCHAR(50),
-	cst_firstname NVARCHAR(50),
-	cst_lastname NVARCHAR(50),
-	cst_marital_status NVARCHAR(50),
-	cst_gndr NVARCHAR(50),
-	cst_create_date DATE,
-	dwh_created_date datetime2 DEFAULT getdate()
-);
+    -- Customer Information
+    -- Cleaning applied during load:
+    --   - Trim whitespace from name fields
+    --   - Standardise marital status and gender values
+    --   - Remove duplicate customer records
+    IF OBJECT_ID('silver.crm_cust_info', 'U') IS NOT NULL
+        DROP TABLE silver.crm_cust_info;
 
-IF OBJECT_ID ('silver.crm_prd_info', 'U') IS NOT NULL
-	DROP TABLE silver.crm_prd_info;
-CREATE TABLE silver.crm_prd_info
-(
-	prd_id INT,
-	prd_key NVARCHAR(50),
-	prd_nm NVARCHAR(50),
-	prd_cost INT,
-	prd_line NVARCHAR(50),
-	prd_start_dt DATETIME,
-	prd_end_dt DATETIME,
-	dwh_created_date datetime2 DEFAULT getdate()
-);
+    CREATE TABLE silver.crm_cust_info (
+        cst_id             INT,                              -- Unique customer identifier
+        cst_key            NVARCHAR(50),                    -- Business key from source
+        cst_firstname      NVARCHAR(50),                    -- Customer first name (trimmed)
+        cst_lastname       NVARCHAR(50),                    -- Customer last name (trimmed)
+        cst_marital_status NVARCHAR(50),                    -- Marital status (standardised: 'Married'/'Single')
+        cst_gndr           NVARCHAR(50),                    -- Gender (standardised: 'Male'/'Female')
+        cst_create_date    DATE,                            -- Date customer record was created in CRM
+        dwh_created_date   DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
 
 
-IF OBJECT_ID ('silver.crm_sales_details', 'U') IS NOT NULL
-	DROP TABLE silver.crm_sales_details;
+    -- Product Information
+    -- Cleaning applied during load:
+    --   - Derive product category from prd_key
+    --   - Handle NULL product costs
+    --   - Calculate prd_end_dt for open-ended products
+    IF OBJECT_ID('silver.crm_prd_info', 'U') IS NOT NULL
+        DROP TABLE silver.crm_prd_info;
 
-CREATE TABLE silver.crm_sales_details
-(
-	sls_ord_num NVARCHAR(50),
-	sls_prd_key NVARCHAR(50),
-	sls_cust_id INT,
-	sls_order_dt INT,
-	sls_ship_dt INT,
-	sls_due_dt INT,
-	sls_sales INT,
-	sls_quantity INT,
-	sls_price INT,
-	dwh_created_date datetime2 DEFAULT getdate()
-);
-
-
-IF OBJECT_ID ('silver.erp_cust_az12', 'U') IS NOT NULL
-	DROP TABLE silver.erp_cust_az12;
-
-CREATE TABLE silver.erp_cust_az12 
-(
-	cid NVARCHAR(50),
-	bdate DATE,
-	gen NVARCHAR(50),
-	dwh_created_date datetime2 DEFAULT getdate()
-);
+    CREATE TABLE silver.crm_prd_info (
+        prd_id           INT,                              -- Unique product identifier
+        prd_key          NVARCHAR(50),                    -- Business key from source
+        prd_nm           NVARCHAR(50),                    -- Product name
+        prd_cost         INT,                             -- Product cost (nulls handled)
+        prd_line         NVARCHAR(50),                    -- Product line (standardised)
+        prd_start_dt     DATETIME,                        -- Product availability start date
+        prd_end_dt       DATETIME,                        -- Product availability end date
+        dwh_created_date DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
 
 
-IF OBJECT_ID ('silver.erp_loc_a101', 'U') IS NOT NULL
-	DROP TABLE silver.erp_loc_a101;
+    -- Sales Details
+    -- Cleaning applied during load:
+    --   - Convert sls_order_dt, sls_ship_dt, sls_due_dt
+    --     from INT to proper DATE format
+    --   - Recalculate sls_sales where incorrect
+    --   - Handle invalid or negative price/quantity values
+    IF OBJECT_ID('silver.crm_sales_details', 'U') IS NOT NULL
+        DROP TABLE silver.crm_sales_details;
 
-CREATE TABLE silver.erp_loc_a101
-(
-	cid NVARCHAR(50),
-	cntry NVARCHAR(50),
-	dwh_created_date datetime2 DEFAULT getdate()
-);
+    CREATE TABLE silver.crm_sales_details (
+        sls_ord_num      NVARCHAR(50),                    -- Sales order number
+        sls_prd_key      NVARCHAR(50),                    -- Product key (links to crm_prd_info)
+        sls_cust_id      INT,                             -- Customer ID (links to crm_cust_info)
+        sls_order_dt     INT,                             -- Order date (will be cast to DATE in Gold)
+        sls_ship_dt      INT,                             -- Ship date (will be cast to DATE in Gold)
+        sls_due_dt       INT,                             -- Due date (will be cast to DATE in Gold)
+        sls_sales        INT,                             -- Total sales amount (recalculated if invalid)
+        sls_quantity     INT,                             -- Quantity sold
+        sls_price        INT,                             -- Unit price (negatives handled)
+        dwh_created_date DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
 
 
+    -- --------------------------------------------------------
+    -- ERP TABLES
+    -- Source : bronze.erp_*
+    -- --------------------------------------------------------
 
-IF OBJECT_ID ('silver.erp_px_cat_g1v2', 'U') IS NOT NULL
-	DROP TABLE silver.erp_px_cat_g1v2;
+    -- Customer Demographics
+    -- Cleaning applied during load:
+    --   - Standardise gender values
+    --   - Remove future birthdates
+    --   - Fix customer ID format to match CRM keys
+    IF OBJECT_ID('silver.erp_cust_az12', 'U') IS NOT NULL
+        DROP TABLE silver.erp_cust_az12;
 
-CREATE TABLE silver.erp_px_cat_g1v2
-(
-	id NVARCHAR(50),
-	cat NVARCHAR(50),
-	subcat NVARCHAR(50),
-	maintenance NVARCHAR(50),
-	dwh_created_date datetime2 DEFAULT getdate()
-);
+    CREATE TABLE silver.erp_cust_az12 (
+        cid              NVARCHAR(50),                    -- Customer ID (cleaned to match CRM format)
+        bdate            DATE,                            -- Date of birth (future dates removed)
+        gen              NVARCHAR(50),                    -- Gender (standardised: 'Male'/'Female'/'n/a')
+        dwh_created_date DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
+
+
+    -- Customer Location
+    -- Cleaning applied during load:
+    --   - Standardise country names
+    --   - Handle NULL and blank country values
+    IF OBJECT_ID('silver.erp_loc_a101', 'U') IS NOT NULL
+        DROP TABLE silver.erp_loc_a101;
+
+    CREATE TABLE silver.erp_loc_a101 (
+        cid              NVARCHAR(50),                    -- Customer ID from ERP
+        cntry            NVARCHAR(50),                    -- Country (standardised full name)
+        dwh_created_date DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
+
+
+    -- Product Category
+    -- Cleaning applied during load:
+    --   - Trim whitespace from category fields
+    --   - Standardise maintenance flag values
+    IF OBJECT_ID('silver.erp_px_cat_g1v2', 'U') IS NOT NULL
+        DROP TABLE silver.erp_px_cat_g1v2;
+
+    CREATE TABLE silver.erp_px_cat_g1v2 (
+        id               NVARCHAR(50),                    -- Product category ID
+        cat              NVARCHAR(50),                    -- Category name (trimmed)
+        subcat           NVARCHAR(50),                    -- Sub-category name (trimmed)
+        maintenance      NVARCHAR(50),                    -- Maintenance flag (standardised)
+        dwh_created_date DATETIME2 DEFAULT GETDATE()      -- Audit: timestamp when record loaded into Silver
+    );
 
 END
+-- ============================================================
+-- End of Procedure : silver.load_silver
+-- ============================================================
